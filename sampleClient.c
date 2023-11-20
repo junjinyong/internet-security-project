@@ -9,10 +9,100 @@
 #include <openssl/ocsp.h>
 #include <openssl/bio.h>
 
-// TODO: Callback function for custom certificate verification
-int verify_callback(int preverify_ok, X509_STORE_CTX *ctx) {
-    return 0;
+#define CUSTOM_VERIFICATION_CALLBACK
+
+// added by junjinyong on 2023.11.21
+#include <openssl/x509_vfy.h>
+
+char* convert(const ASN1_TIME* asn1_time) {
+    struct tm time;
+    ASN1_TIME_to_tm(asn1_time, &time);
+    char* buff = (char*) malloc(20 * sizeof(char));
+    strftime(buff, 20, "%Y.%m.%d %H:%M", &time);
+    return buff;
 }
+
+// TODO: Callback function for custom certificate verification
+#ifndef CUSTOM_VERIFICATION_CALLBACK
+// Default certificate verfication function
+int (*verify_callback)(int preverify, X509_STORE_CTX *ctx) = NULL;
+#else
+
+char str[1048576];
+
+// Custom certificate verification function
+int verify_callback(int preverify, X509_STORE_CTX* ctx) {
+    const int depth = X509_STORE_CTX_get_error_depth(ctx);
+    const int err = X509_STORE_CTX_get_error(ctx);
+    X509 *cert = X509_STORE_CTX_get_current_cert(ctx);
+
+    char subject_str[256];
+    char issuer_str[256];
+
+    X509_NAME *subject_name = X509_get_subject_name(cert);
+    X509_NAME *issuer_name = X509_get_issuer_name(cert);
+    X509_NAME_oneline(subject_name, subject_str, sizeof(subject_str));
+    X509_NAME_oneline(issuer_name, issuer_str, sizeof(issuer_str));
+
+    sprintf(str + strlen(str), "Certificate at depth: %d\n", depth);
+    sprintf(str + strlen(str), "Subject: %s\n", subject_str);
+    sprintf(str + strlen(str), "Issuer: %s\n\n", issuer_str);
+
+    if (!preverify) {
+        printf("%s", str);
+
+        char* buff;
+
+        switch (err) {
+            // Not yet valid certificate
+            case X509_V_ERR_CERT_NOT_YET_VALID:
+                const ASN1_TIME* not_before = X509_get_notBefore(cert);
+                buff = convert(not_before);
+                fprintf(stderr, "Certificate at depth %d is valid from %s\n"
+                                "Certificate verification failed at depth %d with error %d: %s\n",
+                        depth, buff, depth, err, X509_verify_cert_error_string(err));
+                free(buff);
+                break;
+            // Expired certificate
+            case X509_V_ERR_CERT_HAS_EXPIRED:
+                const ASN1_TIME* not_after = X509_get_notAfter(cert);
+                buff = convert(not_after);
+                fprintf(stderr, "Certificate at depth %d has expired on %s\n"
+                                "Certificate verification failed at depth %d with error %d: %s\n",
+                                depth, buff, depth, err, X509_verify_cert_error_string(err));
+                free(buff);
+                break;
+            // Certificate signature failure
+            case X509_V_ERR_CERT_SIGNATURE_FAILURE:
+            // Unable to get local issuer certificate
+            case X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT:
+            // Unable to get certificate CRL
+            case X509_V_ERR_UNABLE_TO_GET_CRL:
+            // No trusted root certificate
+            case X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY:
+            // Unable to get local issuer certificate
+            case X509_V_ERR_KEYUSAGE_NO_CERTSIGN:
+            default:
+                fprintf(stderr, "Certificate verification failed at depth %d with error %d: %s\n",
+                        depth, err, X509_verify_cert_error_string(err));
+                break;
+        }
+
+        return 0;
+    }
+
+    /*
+    // Check key usage (example: require digital signature and key decipherment)
+    int key_usage = X509_get_key_usage(cert);
+    if (!(key_usage & (X509v3_KU_DIGITAL_SIGNATURE | X509v3_KU_KEY_ENCIPHERMENT))) {
+        fprintf(stderr, "Certificate at depth %d does not have required key usage\n", depth);
+        return 0;
+    }
+    */
+
+    return preverify;
+}
+#endif
 
 void print_certificate(X509 *cert) {
     if (cert) {
@@ -79,7 +169,7 @@ int main(int argc, char *argv[]) {
 
     // Initialize OpenSSL
     SSL_load_error_strings();
-    ERR_load_BIO_strings();
+    ERR_load_BIO_strings(); // Deprecated: Error strings are loaded automatically since OpenSSL 1.1.0.
     OpenSSL_add_all_algorithms();
     SSL_library_init();
 
@@ -99,7 +189,7 @@ int main(int argc, char *argv[]) {
     }
 
     // TODO: automatic chain verification should be modified
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, verify_callback);
 
 
     // Create a new BIO chain with an SSL BIO using the context
