@@ -118,7 +118,6 @@ int check(X509 *cert) {
     X509_CRL *crl = d2i_X509_CRL_fp(fp, NULL);
     fclose(fp);
     if(crl == NULL) {
-        printf("Hello from check\n");
         return CRL_NOT_FOUND;
     }
 

@@ -1,3 +1,7 @@
+# Added by junjinyong on 2023.11.23
+.idea
+.idea/*
+
 # Prerequisites
 *.d
 
