@@ -1,1 +1,2 @@
-gcc sampleClient.c -o sampleClient -lssl -lcrypto
+rm cerl.crl
+gcc sampleClient.c -o sampleClient -lssl -lcrypto -lcurl

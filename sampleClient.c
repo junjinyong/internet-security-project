@@ -13,11 +13,20 @@
 
 // added by junjinyong on 2023.11.21
 #include <openssl/x509_vfy.h>
+#include <curl/curl.h>
+#include <openssl/pem.h>
+
+enum STATE {
+    REVOKED = -1,
+    CRL_NOT_FOUND = 0,
+    VALIDATED = 1,
+};
+
 
 char* convert(const ASN1_TIME* asn1_time) {
     struct tm time;
     ASN1_TIME_to_tm(asn1_time, &time);
-    char* buff = (char*) malloc(20 * sizeof(char));
+    char* buff = (char*) malloc(20 * sizeof(char)); // must be freed later
     strftime(buff, 20, "%Y.%m.%d %H:%M", &time);
     return buff;
 }
@@ -51,58 +60,157 @@ int verify_callback(int preverify, X509_STORE_CTX* ctx) {
     if (!preverify) {
         printf("%s", str);
 
-        char* buff;
-
         switch (err) {
             // Not yet valid certificate
             case X509_V_ERR_CERT_NOT_YET_VALID:
                 const ASN1_TIME* not_before = X509_get_notBefore(cert);
-                buff = convert(not_before);
-                fprintf(stderr, "Certificate at depth %d is valid from %s\n"
-                                "Certificate verification failed at depth %d with error %d: %s\n",
-                        depth, buff, depth, err, X509_verify_cert_error_string(err));
-                free(buff);
+                char* buff1 = convert(not_before);
+                fprintf(stderr, "Certificate at depth %d is valid from %s\n", depth, buff1);
+                free(buff1);
                 break;
             // Expired certificate
             case X509_V_ERR_CERT_HAS_EXPIRED:
                 const ASN1_TIME* not_after = X509_get_notAfter(cert);
-                buff = convert(not_after);
-                fprintf(stderr, "Certificate at depth %d has expired on %s\n"
-                                "Certificate verification failed at depth %d with error %d: %s\n",
-                                depth, buff, depth, err, X509_verify_cert_error_string(err));
-                free(buff);
+                char* buff2 = convert(not_after);
+                fprintf(stderr, "Certificate at depth %d has expired on %s\n", depth, buff2);
+                free(buff2);
                 break;
             // Certificate signature failure
             case X509_V_ERR_CERT_SIGNATURE_FAILURE:
+                fprintf(stderr, "Certificate signature failed at depth %d\n", depth);
+                break;
             // Unable to get local issuer certificate
             case X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT:
+                fprintf(stderr, "Unable to get local issuer certificate at depth %d\n", depth);
+                break;
             // Unable to get certificate CRL
             case X509_V_ERR_UNABLE_TO_GET_CRL:
+                fprintf(stderr, "Unable to get certificate CRL at depth %d\n", depth);
+                break;
             // No trusted root certificate
             case X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY:
+                fprintf(stderr, "No trusted root certificate at depth %d\n", depth);
+                break;
             // Unable to get local issuer certificate
             case X509_V_ERR_KEYUSAGE_NO_CERTSIGN:
+                fprintf(stderr, "Unable to get local issuer certificate at depth %d\n", depth);
+                break;
             default:
-                fprintf(stderr, "Certificate verification failed at depth %d with error %d: %s\n",
-                        depth, err, X509_verify_cert_error_string(err));
                 break;
         }
 
-        return 0;
-    }
+        fprintf(stderr, "Certificate verification failed at depth %d with error %d: %s\n",
+                depth, err, X509_verify_cert_error_string(err));
 
-    /*
-    // Check key usage (example: require digital signature and key decipherment)
-    int key_usage = X509_get_key_usage(cert);
-    if (!(key_usage & (X509v3_KU_DIGITAL_SIGNATURE | X509v3_KU_KEY_ENCIPHERMENT))) {
-        fprintf(stderr, "Certificate at depth %d does not have required key usage\n", depth);
         return 0;
     }
-    */
 
     return preverify;
 }
 #endif
+
+int check(X509 *cert) {
+    FILE* fp = fopen("cert.crl", "rb");
+    if (fp == NULL) {
+        return CRL_NOT_FOUND;
+    }
+
+    X509_CRL *crl = d2i_X509_CRL_fp(fp, NULL);
+    fclose(fp);
+    if(crl == NULL) {
+        printf("Hello from check\n");
+        return CRL_NOT_FOUND;
+    }
+
+    const ASN1_INTEGER* serial = X509_get_serialNumber(cert);
+
+    STACK_OF(X509_REVOKED)* list = X509_CRL_get_REVOKED(crl);
+    const int number = sk_X509_REVOKED_num(list);
+    printf("number: %d\n\n", number);
+    for (int i = 0; i < number; ++i) {
+        const X509_REVOKED* revoked = sk_X509_REVOKED_value(list, i);
+        const ASN1_INTEGER* revoked_serial = X509_REVOKED_get0_serialNumber(revoked);
+        if (ASN1_INTEGER_cmp(serial, revoked_serial) == 0) {
+            return REVOKED;
+        }
+    }
+
+    return VALIDATED;
+}
+
+static size_t write_callback(void *contents, size_t size, size_t nmemb, FILE *stream) {
+    return fwrite(contents, size, nmemb, stream);
+}
+
+int download_CRL(const unsigned char* addr) {
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    CURL* curl = curl_easy_init();
+    if (curl == NULL) {
+        return 0;
+    }
+
+    FILE* fp = fopen("cert.crl", "wb");
+    if (fp == NULL) {
+        return 0;
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, addr);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    CURLcode res = curl_easy_perform(curl);
+    fclose(fp);
+    if (res != CURLE_OK) {
+        return 0;
+    }
+    curl_easy_cleanup(curl);
+
+    return 1;
+}
+
+int check_CRL(X509 *cert) {
+    STACK_OF(DIST_POINT)* dp_stack = X509_get_ext_d2i(cert, NID_crl_distribution_points, NULL, NULL);
+    if (dp_stack == NULL) {
+        return 0;
+    }
+
+    const int number = sk_DIST_POINT_num(dp_stack);
+    int flag = CRL_NOT_FOUND;
+    for (int i = 0; i < number; ++i) {
+        DIST_POINT* dp = sk_DIST_POINT_value(dp_stack, i);
+        if (dp == NULL || (dp -> distpoint) == NULL) {
+            continue;
+        }
+
+        GENERAL_NAMES* names = (dp -> distpoint -> name).fullname;
+        if (names == NULL) {
+            continue;
+        }
+
+        const int count = sk_GENERAL_NAME_num(names);
+        for (int j = 0; j < count; ++j) {
+            GENERAL_NAME* name = sk_GENERAL_NAME_value(names, j);
+            if (name == NULL || (name -> type != GEN_URI)) {
+                continue;
+            }
+
+            const unsigned char* addr = (name -> d).uniformResourceIdentifier -> data;
+            if (download_CRL(addr) == 0) {
+                continue;
+            }
+
+            printf("CRL distribution point: %s\n", addr);
+            if (check(cert) != REVOKED && flag != REVOKED) {
+                flag = VALIDATED;
+            } else {
+                flag = REVOKED;
+            }
+        }
+
+    }
+
+    return flag;
+}
+
 
 void print_certificate(X509 *cert) {
     if (cert) {
@@ -181,6 +289,7 @@ int main(int argc, char *argv[]) {
     }
 
     // TODO: Set the location of the trust store. Currently based on Debian.
+    // Done
     if (!SSL_CTX_load_verify_locations(ctx, "/etc/ssl/certs/ca-certificates.crt", NULL)) {
         fprintf(stderr, "Error setting up trust store.\n");
         ERR_print_errors_fp(stderr);
@@ -189,6 +298,7 @@ int main(int argc, char *argv[]) {
     }
 
     // TODO: automatic chain verification should be modified
+    // Done
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, verify_callback);
 
 
@@ -302,6 +412,7 @@ int main(int argc, char *argv[]) {
     }
 
     // Print details for each certificate in the chain
+    int flag = 0;
     for (int i = 0; i < sk_X509_num(cert_chain); i++) {
         cert = sk_X509_value(cert_chain, i);
         if (verbose) {
@@ -316,6 +427,17 @@ int main(int argc, char *argv[]) {
             save_certificate(cert, filename);
         }
         // TODO: Get CRL distribution points and OCSP responder URI
+        if (i == 0) {
+            flag = check_CRL(cert);
+        }
+    }
+
+    if (flag == CRL_NOT_FOUND) {
+        fprintf(stderr, "No certificate distribution point found at depth 0\n");
+    } else if (flag == REVOKED) {
+        fprintf(stderr, "Certificate is revocated at depth 0\n");
+    } else if (flag == VALIDATED) {
+        printf("Certificate is not revocated at level 0\n");
     }
 
     // Clean up
